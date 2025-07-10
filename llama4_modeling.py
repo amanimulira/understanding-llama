@@ -34,7 +34,7 @@ a "gate" mechanism then determines which expert(s) should process each input.
 improving model capacity and efficiency.
 
 """
-class Llama4Text(nn.Module):
+class Llama4TextExperts(nn.Module):
 	def __init__(self, config: Llama4TextConfig):
 		super().__init__()
 		self.num_experts = config.num_local_experts
@@ -106,5 +106,84 @@ class Llama4Text(nn.Module):
 		next_states = next_states.view(-1, self.hidden_size)
 
 		return next_states
+	
+class Llama4TextMLP(nn.Module):
+	def __init__(self, config, intermediate_size=None):
+		super().__init__()
 
-            
+		if intermediate_size is None:
+			intermediate_size = config.intermediate_size
+
+		self.config = config
+		self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+		self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+		self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+		self.activation_fn = ACT2FN[config.hidden_act]
+
+	def forward(self, x):
+		down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
+		return self.down_proj(down_proj)
+	
+class Llama4TextL2Norm(torch.nn.Module):
+	def __init__(self, eps: float = 1e-6):
+		super().__init__()
+		self.eps = eps
+	
+	def _norm(self, x):
+		return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+	
+	def forward(self, x):
+		return self._norm(x.float()).type_as(x)
+	
+	def extra_repr(self):
+		return f"eps={self.eps}"
+	
+class Llama4TextRMSNorm(nn.Module):
+	def __init__(self, hidden_size, eps=1e-5):
+		super().__init__()
+
+		self.eps = eps
+		self.weight = nn.Parameter(torch.one(hidden_size))
+
+	def _norm(self, x):
+		return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+	
+	def forward(self, x):
+		output = self._norm(x.float()).type_as(x)
+		return output * self.weight
+	
+	def extra_pepr(self):
+		return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+@use_kernel_forward_from_hub("Llama4TextMoe")
+class Llama4TextMoe(nn.Module):
+	def __init__(self, config):
+		super().__init__()
+		self.top_k = config.num_experts_per_tok
+		self.hidden_dim = config.hidden_size
+		self.num_experts = config.num_local_experts
+		self.experts = Llama4TextExperts(config)
+		self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+		self.shared_expert = Llama4TextMLP(config)
+
+	def forward(self, hidden_states):
+		hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+		router_logits = self.router(hidden_states)
+
+		router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=1)
+
+		router_scores = (
+			torch.full_like(router_logits, float("-inf")).scatter_(1, router_indices, router_top_value).transpose(0, 1)
+		)
+		router_scores = torch.sigmoid(router_scores.float()).to(hidden_states.dtype)
+
+		routed_in = hidden_states.repeat(self.num_experts, 1)
+		routed_in = routed_in * router_scores.reshape(-1, 1)
+		routed_out = self.experts(routed_in)
+
+		out = self.shared_expert(hidden_states)
+		out.add(routed_out.reshape(self.num_experts, -1, self.hidden_dim).sum(dim=0))
+
+		return out, router_scores
+
+
