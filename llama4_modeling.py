@@ -265,3 +265,27 @@ def eager_attention_forward(
 
 	return attn_output, attn_weights
 
+def vision_eager_attention_forward(
+		module: nn.Module, 
+		query: torch.Tensor, 
+		key: torch.Tensor, 
+		value: torch.Tensor, 
+		attention_mask: Optional[torch.Tensor],
+		scaling: float, 
+		dropout: float = 0.0,
+		**kwargs,
+):
+	key_states = repeat_kv(key, module.num_key_value_groups)
+	value_states = repeat_kv(value, module.num_key_value_groups)
+
+	attn_weights = torch.matmul(key_states, query)
+	if attention_mask is not None:
+		causal_mask = attention_mask[:, :, :, :, key_states.shape[-2]]
+		attn_weights = attn_weights + causal_mask
+	
+	attn_weights = nn.funcitonal.softmax(attn_weights, dim=-1)
+	attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+	attn_output = torch.matmul(attn_weights, value_states)
+	attn_output = attn_output.transpose(1, 2).contiguous()
+
