@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
+from transformers.models.llama4 import Llama4VisionConfig
 
 from activations import ACT2FN
 from cache_utils import Cache, DynamicCache
@@ -90,7 +90,7 @@ class Llama4TextExperts(nn.Module):
 
 		# torch.bmm, for each expert i:
 		# intermediate result: (up * self.act_fn(gate))[i]
-		# the shape -  (total_tokens_per_expert, expert_dim)
+		# the shape -> (total_tokens_per_expert, expert_dim)
 
 		# self.down_proj[i] (shape expert_dim, hidden_size)
 
@@ -186,4 +186,31 @@ class Llama4TextMoe(nn.Module):
 
 		return out, router_scores
 
+class Llama4TextRotaryEmbedding(nn.Module):
+	def __init__(self, config: Llama4TextConfig, device=None):
+		super().__init__()
+		self.rope_type = "llama3" if config.rope_scaling is not None else "default"
 
+		self.max_seq_len_cached = config.max_position_embeddings
+		self.original_max_seq_len = config.max_position_embeddings
+
+		self.config = config
+		self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+		inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+		self.register_buffer("inv_freq", inv_freq, persistent=False)
+		self.original_inv_freq = self.inv_freq
+
+	@torch.no_grad()
+	@dynamic_rope_update
+	def forward(self, x, position_ids):
+		inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+		position_ids_expanded = position_ids[:, None, :].float()
+
+		device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+		with torch.autocast(device_type=device_type, enabled=False):
+			freqs = (inv_freq_expanded.to(x.device) @ position_ids_expanded).transpose(1, 2)
+			freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+			freqs_cis = freqs_cis * self.attention_scaling
+
+		return freqs_cis
