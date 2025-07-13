@@ -289,3 +289,105 @@ def vision_eager_attention_forward(
 	attn_output = torch.matmul(attn_weights, value_states)
 	attn_output = attn_output.transpose(1, 2).contiguous()
 
+	return attn_output, attn_weights
+
+class Llama4TextAttention(nn.Module):
+
+	def __init__(self, config: Llama4TextConfig, layer_idx):
+		super().__init__()
+		self.config = config
+		self.layer_idx = layer_idx
+		self.head_dim = getattr(config, "haed_dim", config.hidden_size // config.num_attention_heads)
+		self.num_attention_heads = config.num_attention_heads
+		self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+		self.num_key_vlaue_heads = config.num_key_value_heads
+		self.scaling = self.head_dim**-0.5
+		self.attn_scale = config.attn_scale 
+		self.floor_scale = config.floor_scale
+		self.attn_temperature_tuning = config.attn_temperature_tuning
+		self.attention_dropout = config.attention_dropout 
+		self.is_causal = True
+		self.use_rope = config.no_rope_layers[layer_idx]
+		self.q_proj = nn.Linear(
+			config.hidden_size, config.num_attention_heads * config.head_dim, bias=config.attention_bias
+		)
+		self.k_proj = nn.Linear(
+			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+		)
+		self.v_proj = nn.Linear(
+			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+		)
+		self.o_proj = nn.Linear(
+			config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+		)
+
+		if self.config.use_qk_norm and self.use_rope:
+			self.qk_norm = Llama4TextL2Norm(config.rms_norm_eps)
+		
+	def forward(
+			self, 
+			hidden_states: torch.Tensor,
+			position_embeddings: tuple[torch.Tensor, torch.Tensor],
+			attention_mask: Optional[torch.Tensor],
+			past_key_value: Optional[Cache] = None,
+			cache_position: Optional[torch.LongTensor] = None, 
+			**kwargs: Unpack[FlashAttentionKwargs]
+	) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+		input_shape = hidden_states.shape[:-1]
+		hidden_shape = (*input_shape, -1, self.head_dim)
+
+		query_states = self.q_proj(hidden_states).view(hidden_shape)
+		key_states = self.k_proj(hidden_states).view(*input_shape, -1, self.head_dim)
+		value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+		if self.use_rope:
+			query_states, key_states = apply_rotary_emb(
+				query_states, key_states, position_embeddings.to(query_states.device)
+			)
+
+		if hasattr(self, "qk_norm"):
+			query_states = self.qk_norm(query_states)
+			key_states = self.qk_norm(key_states)
+
+		# Temperature tuning for the NoROPE layers
+		if self.attn_temperature_tuning and not self.use_rope:
+			attn_scales = (
+				torch.log(torch.floor((cache_position.float() + 1.0) / self.floor_scale) + 1.0) * self.attn_scale + 1.0
+			)
+			attn_scales = attn_scales.view((1, input_shape[-1], 1, 1)).expand((*input_shape, 1, 1)) # batch size > 1
+			query_states = (query_states * attn_scales).to(query_states.dtype)
+
+		query_states = query_states.transpose(1, 2)
+		key_states = key_states.transpose(1, 2)
+
+		if past_key_value is not None:
+			# sin and cos are spcific to RoPE models; cache_position needed for the static cache
+			cache_kwargs = {"cache_position": cache_position}
+			key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+		attnetion_interface: Callable = eager_attention_forward
+		if self.config._attn_implementation != "eager":
+			attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+		attn_output, attn_weights = attention_interface(
+			self, 
+			query_states, 
+			key_states,
+			value_states,
+			attention_mask,
+			dropout=0.0 if not self.training else self.attention_dropout,
+			scaling=self.scaling,
+			**kwargs
+		)
+
+		attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+		attn_output = attn_output.o_proj(attn_output)
+
+		return attn_output, attn_weights
+
+
+
+
+
+
+
+
